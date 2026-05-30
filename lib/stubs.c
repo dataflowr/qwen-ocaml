@@ -130,6 +130,133 @@ static inline uint16_t qwen_rd_u16le(const uint8_t *p) {
   return (uint16_t)(p[0] | (p[1] << 8));
 }
 
+/* ===================================================================== */
+/* P2: int8 dot product (vdotq_s32), matching llama.cpp EXACTLY.         */
+/*                                                                       */
+/* For Q8_0 and Q5_0 weights, llama.cpp quantizes the activation to Q8_0 */
+/* (per-32 block: int8 + an fp16 scale) and computes the row dot in int8 */
+/* (vdotq_s32), accumulating the per-block products into a float32x4     */
+/* vector reduced ONCE at the end. The exact fp32 accumulation ORDER is  */
+/* what makes the output char-for-char identical to llama.cpp -- summing */
+/* the per-block scalars in any other order flips a near-tie argmax a few */
+/* dozen tokens in and the streams diverge. So we port ggml's NEON       */
+/* dotprod kernel verbatim: blocks paired into sumv0/sumv1, each block's */
+/* int32x4 from vdotq scaled by (weight_d * act_d) via vmlaq_n_f32, and  */
+/* a final vaddvq_f32(sumv0)+vaddvq_f32(sumv1).                          */
+/* ===================================================================== */
+
+/* Quantize the activation x[0..n) to Q8_0 blocks, replicating ggml's
+   quantize_row_q8_0: per 32-block scale d = amax/127, round-half-to-even
+   (vcvtnq_s32_f32), and the block scale ROUND-TRIPPED through fp16 (so the
+   dot below uses the same fp16 scale ggml stored). [n] is a multiple of 32. */
+static inline void quantize_act_q8_0(const float *x, int8_t *xq, float *xd, int n) {
+  int nb = n / QK8_0;
+  for (int b = 0; b < nb; b++) {
+    const float *xb = x + (size_t)b * QK8_0;
+    float amax = 0.0f;
+    for (int j = 0; j < QK8_0; j++) {
+      float a = xb[j] < 0.0f ? -xb[j] : xb[j];
+      if (a > amax) amax = a;
+    }
+    float d  = amax / 127.0f;
+    float id = (d != 0.0f) ? 1.0f / d : 0.0f;
+    __fp16 dh = (__fp16) d;          /* ggml stores y[i].d as fp16 */
+    xd[b] = (float) dh;
+    int8_t *q = xq + (size_t)b * QK8_0;
+    for (int j = 0; j < QK8_0; j += 16) {
+      int32x4_t v0 = vcvtnq_s32_f32(vmulq_n_f32(vld1q_f32(xb + j + 0),  id));
+      int32x4_t v1 = vcvtnq_s32_f32(vmulq_n_f32(vld1q_f32(xb + j + 4),  id));
+      int32x4_t v2 = vcvtnq_s32_f32(vmulq_n_f32(vld1q_f32(xb + j + 8),  id));
+      int32x4_t v3 = vcvtnq_s32_f32(vmulq_n_f32(vld1q_f32(xb + j + 12), id));
+      int16x8_t s01 = vcombine_s16(vmovn_s32(v0), vmovn_s32(v1));
+      int16x8_t s23 = vcombine_s16(vmovn_s32(v2), vmovn_s32(v3));
+      vst1q_s8(q + j, vcombine_s8(vmovn_s16(s01), vmovn_s16(s23)));
+    }
+  }
+}
+
+/* unpack one Q5_0 block to signed int8 wq[32] (wq[0..15]=low nibble weights,
+   wq[16..31]=high nibble weights), identical integer semantics to the scalar
+   dequant -- so the vdotq result equals ggml's. */
+static inline void unpack_q5_0_block(const uint8_t *p, int8_t *wq) {
+  const uint8_t *qs = p + 6;
+  uint32_t QH;
+  memcpy(&QH, p + 2, 4);
+  for (int j = 0; j < 16; j++) {
+    uint8_t xh0 = (uint8_t)(((QH >> (j +  0)) << 4) & 0x10);
+    uint8_t xh1 = (uint8_t)(((QH >> (j + 12))     ) & 0x10);
+    wq[j]      = (int8_t)(((qs[j] & 0x0F) | xh0) - 16);
+    wq[j + 16] = (int8_t)(((qs[j] >>   4) | xh1) - 16);
+  }
+}
+
+/* Q8_0 weight row . Q8_0 activation -> fp32, ggml's exact accumulation order. */
+static inline float qdot_q8_0_row(const uint8_t *w, const int8_t *xq,
+                                  const float *xd, int nb) {
+  float32x4_t sv0 = vdupq_n_f32(0.0f), sv1 = vdupq_n_f32(0.0f);
+  int i = 0;
+  for (; i + 2 <= nb; i += 2) {
+    const uint8_t *p0 = w + (size_t)(i + 0) * Q8_0_BYTES;
+    const uint8_t *p1 = w + (size_t)(i + 1) * Q8_0_BYTES;
+    const int8_t *a0 = xq + (size_t)(i + 0) * QK8_0;
+    const int8_t *a1 = xq + (size_t)(i + 1) * QK8_0;
+    int32x4_t p0v = vdotq_s32(vdotq_s32(vdupq_n_s32(0),
+                      vld1q_s8((const int8_t *)(p0 + 2)),      vld1q_s8(a0)),
+                      vld1q_s8((const int8_t *)(p0 + 2 + 16)), vld1q_s8(a0 + 16));
+    int32x4_t p1v = vdotq_s32(vdotq_s32(vdupq_n_s32(0),
+                      vld1q_s8((const int8_t *)(p1 + 2)),      vld1q_s8(a1)),
+                      vld1q_s8((const int8_t *)(p1 + 2 + 16)), vld1q_s8(a1 + 16));
+    float wd0 = qwen_half_to_float(qwen_rd_u16le(p0));
+    float wd1 = qwen_half_to_float(qwen_rd_u16le(p1));
+    sv0 = vmlaq_n_f32(sv0, vcvtq_f32_s32(p0v), wd0 * xd[i + 0]);
+    sv1 = vmlaq_n_f32(sv1, vcvtq_f32_s32(p1v), wd1 * xd[i + 1]);
+  }
+  float sumf = vaddvq_f32(sv0) + vaddvq_f32(sv1);
+  for (; i < nb; i++) {  /* odd-block tail (not hit for Qwen widths) */
+    const uint8_t *p0 = w + (size_t)i * Q8_0_BYTES;
+    const int8_t *a0 = xq + (size_t)i * QK8_0;
+    int32x4_t p0v = vdotq_s32(vdotq_s32(vdupq_n_s32(0),
+                      vld1q_s8((const int8_t *)(p0 + 2)),      vld1q_s8(a0)),
+                      vld1q_s8((const int8_t *)(p0 + 2 + 16)), vld1q_s8(a0 + 16));
+    sumf += vaddvq_f32(vcvtq_f32_s32(p0v)) * (qwen_half_to_float(qwen_rd_u16le(p0)) * xd[i]);
+  }
+  return sumf;
+}
+
+/* Q5_0 weight row . Q8_0 activation -> fp32, ggml's exact accumulation order. */
+static inline float qdot_q5_0_row(const uint8_t *w, const int8_t *xq,
+                                  const float *xd, int nb) {
+  float32x4_t sv0 = vdupq_n_f32(0.0f), sv1 = vdupq_n_f32(0.0f);
+  int8_t wq0[32], wq1[32];
+  int i = 0;
+  for (; i + 2 <= nb; i += 2) {
+    const uint8_t *p0 = w + (size_t)(i + 0) * Q5_0_BYTES;
+    const uint8_t *p1 = w + (size_t)(i + 1) * Q5_0_BYTES;
+    unpack_q5_0_block(p0, wq0);
+    unpack_q5_0_block(p1, wq1);
+    const int8_t *a0 = xq + (size_t)(i + 0) * QK5_0;
+    const int8_t *a1 = xq + (size_t)(i + 1) * QK5_0;
+    int32x4_t p0v = vdotq_s32(vdotq_s32(vdupq_n_s32(0),
+                      vld1q_s8(wq0), vld1q_s8(a0)), vld1q_s8(wq0 + 16), vld1q_s8(a0 + 16));
+    int32x4_t p1v = vdotq_s32(vdotq_s32(vdupq_n_s32(0),
+                      vld1q_s8(wq1), vld1q_s8(a1)), vld1q_s8(wq1 + 16), vld1q_s8(a1 + 16));
+    float wd0 = qwen_half_to_float(qwen_rd_u16le(p0));
+    float wd1 = qwen_half_to_float(qwen_rd_u16le(p1));
+    sv0 = vmlaq_n_f32(sv0, vcvtq_f32_s32(p0v), wd0 * xd[i + 0]);
+    sv1 = vmlaq_n_f32(sv1, vcvtq_f32_s32(p1v), wd1 * xd[i + 1]);
+  }
+  float sumf = vaddvq_f32(sv0) + vaddvq_f32(sv1);
+  for (; i < nb; i++) {  /* odd-block tail (not hit for Qwen widths) */
+    const uint8_t *p0 = w + (size_t)i * Q5_0_BYTES;
+    unpack_q5_0_block(p0, wq0);
+    const int8_t *a0 = xq + (size_t)i * QK5_0;
+    int32x4_t p0v = vdotq_s32(vdotq_s32(vdupq_n_s32(0),
+                      vld1q_s8(wq0), vld1q_s8(a0)), vld1q_s8(wq0 + 16), vld1q_s8(a0 + 16));
+    sumf += vaddvq_f32(vcvtq_f32_s32(p0v)) * (qwen_half_to_float(qwen_rd_u16le(p0)) * xd[i]);
+  }
+  return sumf;
+}
+
 /* --- Q8_0: 34 bytes / 32 weights.  w[j] = d * qs[j] --- */
 static void dequant_row_q8_0(const uint8_t *src, float *dst, int n) {
   int nb = n / QK8_0;
@@ -300,6 +427,40 @@ CAMLprim value caml_qwen_qmatvec(value vBlob, value vBase, value vTy,
     /* no dequant needed; Accelerate GEMV directly on the mmap. */
     cblas_sgemv(CblasRowMajor, CblasNoTrans, (int) rows, (int) cols,
                 1.0f, (const float *)src0, (int) cols, x, 1, 0.0f, out, 1);
+    caml_acquire_runtime_system();
+    return Val_unit;
+  }
+
+  /* P2: Q8_0 / Q5_0 -> int8 vdotq path (matches llama.cpp exactly).
+     Quantize the activation to Q8_0 ONCE, then each row dot is int8. */
+  if (ty == GGML_TYPE_Q8_0 || ty == GGML_TYPE_Q5_0) {
+    const int icols2 = (int) cols;
+    const int nb = icols2 / QK8_0;
+    int8_t xq[icols2];
+    float  xd[nb];
+    quantize_act_q8_0(x, xq, xd, icols2);
+    const int8_t *xqp = xq;     /* capturable (VLAs can't be captured by a block) */
+    const float  *xdp = xd;
+    const int is_q8 = (ty == GGML_TYPE_Q8_0);
+    if (rows <= 256) {
+      for (intnat r = 0; r < rows; r++) {
+        const uint8_t *wr = src0 + (size_t)r * stride;
+        out[r] = is_q8 ? qdot_q8_0_row(wr, xqp, xdp, nb)
+                       : qdot_q5_0_row(wr, xqp, xdp, nb);
+      }
+    } else {
+      size_t n_chunks = 32;
+      size_t chunk = ((size_t)rows + n_chunks - 1) / n_chunks;
+      dispatch_apply(n_chunks, DISPATCH_APPLY_AUTO, ^(size_t c) {
+        size_t r0 = c * chunk;
+        size_t r1 = r0 + chunk; if (r1 > (size_t)rows) r1 = rows;
+        for (size_t r = r0; r < r1; r++) {
+          const uint8_t *wr = src0 + r * stride;
+          out[r] = is_q8 ? qdot_q8_0_row(wr, xqp, xdp, nb)
+                         : qdot_q5_0_row(wr, xqp, xdp, nb);
+        }
+      });
+    }
     caml_acquire_runtime_system();
     return Val_unit;
   }
