@@ -14,6 +14,9 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/sysctl.h>
+#include <pthread.h>
+#include <stdatomic.h>
+#include <time.h>
 #include <Accelerate/Accelerate.h>
 #include <dispatch/dispatch.h>
 #include <arm_neon.h>
@@ -314,6 +317,136 @@ static int qwen_serial_rows(void) {
   return v;
 }
 
+/* ===================================================================== */
+/* P3 STRETCH: persistent pthread pool (replaces per-call dispatch_apply). */
+/*                                                                         */
+/* The committed P3 fix already removed the E-core straggler, but every    */
+/* large matvec still pays GCD's dispatch_apply launch+barrier (~120 such  */
+/* calls/token). A persistent pool keeps the workers alive and spinning so */
+/* a new job is just an atomic publish + a counted barrier -- no thread    */
+/* wakeup syscall on the hot path.                                         */
+/*                                                                         */
+/* CORRECTNESS (this is exactly where a naive pool data-races):            */
+/*  - STATIC partition: participant i always processes chunk i. There is   */
+/*    NO shared work-stealing counter to race on between generations.      */
+/*  - Each participant increments chunks_done EXACTLY once per job; main    */
+/*    waits until chunks_done == n_chunks, so when it republishes, every    */
+/*    worker has finished and is back spinning -- the reset can't race.     */
+/*  - Workers are pure pthreads: they NEVER call caml_* (runtime already    */
+/*    released by the caller) and write DISJOINT out[] ranges.             */
+/*  - Job payload is written before the release-bump of `generation`;       */
+/*    workers read it after the acquire-load -> happens-before, no torn read*/
+/*  - Spin + 50us nanosleep backoff: zero wakeup syscalls during the tight  */
+/*    decode loop; ~0 CPU when idle. No condvar => no lost-wakeup race.     */
+/* ===================================================================== */
+
+typedef struct {
+  int ty;
+  const uint8_t *src0;
+  const float *x;
+  float *out;
+  size_t stride;
+  intnat rows;
+  int cols;
+  size_t chunk;     /* rows per chunk */
+} qpool_job;
+
+static struct {
+  pthread_t *threads;
+  int n_workers;                 /* = n_chunks - 1 (main is the +1) */
+  int n_chunks;
+  _Atomic uint32_t generation;   /* bumped (release) to publish a job */
+  _Atomic int chunks_done;       /* each participant +1 (release) when done */
+  _Atomic int shutdown;
+  qpool_job job;                 /* written before the generation bump */
+} qpool = {0};
+
+/* process exactly chunk [c] of the current job (disjoint row range). */
+static void qpool_run_chunk(const qpool_job *j, int c) {
+  size_t r0 = (size_t)c * j->chunk;
+  if (r0 >= (size_t)j->rows) return;            /* empty tail chunk */
+  size_t r1 = r0 + j->chunk; if (r1 > (size_t)j->rows) r1 = j->rows;
+  int icols = j->cols;
+  float scratch[icols];
+  for (size_t r = r0; r < r1; r++) {
+    qwen_dequant_dispatch(j->ty, j->src0 + r * j->stride, scratch, icols);
+    j->out[r] = qwen_dot_f32(scratch, j->x, icols);
+  }
+}
+
+static void *qpool_worker(void *arg) {
+  const int id = (int)(intptr_t)arg;            /* this worker owns chunk [id] */
+  uint32_t my_gen = 0;
+  for (;;) {
+    int spins = 0;
+    while (atomic_load_explicit(&qpool.generation, memory_order_acquire) == my_gen) {
+      if (atomic_load_explicit(&qpool.shutdown, memory_order_relaxed)) return NULL;
+      if (++spins < 4000) {
+        __asm__ __volatile__("yield");
+      } else {
+        struct timespec ts = {0, 50000};        /* 50us idle backoff */
+        nanosleep(&ts, NULL);
+      }
+    }
+    my_gen = atomic_load_explicit(&qpool.generation, memory_order_acquire);
+    qpool_run_chunk(&qpool.job, id);
+    atomic_fetch_add_explicit(&qpool.chunks_done, 1, memory_order_release);
+  }
+}
+
+static pthread_once_t qpool_once = PTHREAD_ONCE_INIT;
+static void qpool_init_once(void) {
+  int n = qwen_nchunks();
+  qpool.n_chunks = n;
+  qpool.n_workers = n - 1;
+  atomic_store(&qpool.generation, 0);
+  atomic_store(&qpool.chunks_done, 0);
+  atomic_store(&qpool.shutdown, 0);
+  if (qpool.n_workers > 0) {
+    qpool.threads = (pthread_t *) malloc(sizeof(pthread_t) * qpool.n_workers);
+    for (int i = 0; i < qpool.n_workers; i++)   /* workers own chunks 1..n_workers */
+      pthread_create(&qpool.threads[i], NULL, qpool_worker, (void *)(intptr_t)(i + 1));
+  }
+}
+
+/* Run the current matvec across the pool. Main owns chunk 0. Returns after the
+   counted barrier. Numerically identical to the serial/dispatch_apply paths. */
+static void qpool_matvec(int ty, const uint8_t *src0, const float *x, float *out,
+                         size_t stride, intnat rows, int icols) {
+  pthread_once(&qpool_once, qpool_init_once);
+  const int N = qpool.n_chunks;
+  qpool.job.ty = ty; qpool.job.src0 = src0; qpool.job.x = x; qpool.job.out = out;
+  qpool.job.stride = stride; qpool.job.rows = rows; qpool.job.cols = icols;
+  qpool.job.chunk = ((size_t)rows + N - 1) / N;
+  atomic_store_explicit(&qpool.chunks_done, 0, memory_order_relaxed);
+  atomic_fetch_add_explicit(&qpool.generation, 1, memory_order_release);  /* publish */
+  qpool_run_chunk(&qpool.job, 0);                                         /* main does chunk 0 */
+  atomic_fetch_add_explicit(&qpool.chunks_done, 1, memory_order_release);
+  while (atomic_load_explicit(&qpool.chunks_done, memory_order_acquire) < N)
+    __asm__ __volatile__("yield");
+}
+
+/* env QWEN_POOL: 1 = persistent pool; 0 (default) = GCD dispatch_apply.
+ *
+ * STRETCH RESULT (honest): the pool is CORRECT and stable (20/20 MATCH, no
+ * crashes) but does NOT beat dispatch_apply -- interleaved A/B on M3 Max:
+ * pool ~27.9 vs dispatch ~29.0 tok/s, and the pool DEGRADES across a session
+ * (28.4 -> 26.7). Two reasons: (1) GCD's dispatch_apply is already a tuned,
+ * warm thread pool, so the per-call launch we removed was not actually the
+ * bottleneck; (2) between matvecs the main thread runs the SERIAL OCaml work
+ * (attention/RoPE/RMSNorm/sampling), during which the pool's spinning workers
+ * burn P-cores for nothing -- stealing power/thermal headroom and contending
+ * with the main thread. So it's off by default. The takeaway refines the
+ * roofline: the gap to llama.cpp is NOT GCD overhead (removing it didn't help)
+ * -- it's the per-call caml_release/acquire + the scalar OCaml ops that run
+ * serially. The real next lever is vectorizing/parallelizing attention, not the
+ * dispatch mechanism. */
+static int qwen_use_pool(void) {
+  static int v = -1;
+  if (v < 0) { const char *s = getenv("QWEN_POOL"); v = s ? atoi(s) : 0; }
+  return v;
+}
+
 /* Fused GEMV: out[r] = dot(dequant(row r), x[0..cols)) for r in 0..rows.
  * Rows are contiguous; per-row byte stride from qwen_row_bytes. */
 CAMLprim value caml_qwen_qmatvec(value vBlob, value vBase, value vTy,
@@ -358,6 +491,8 @@ CAMLprim value caml_qwen_qmatvec(value vBlob, value vBase, value vTy,
       qwen_dequant_dispatch(ty, src0 + (size_t)r * stride, scratch, icols);
       out[r] = qwen_dot_f32(scratch, x, icols);
     }
+  } else if (qwen_use_pool()) {
+    qpool_matvec(ty, src0, x, out, stride, rows, icols);
   } else {
     size_t n_chunks = (size_t) qwen_nchunks();
     size_t chunk = ((size_t)rows + n_chunks - 1) / n_chunks;
