@@ -12,6 +12,7 @@
 #include <caml/fail.h>
 #include <stdint.h>
 #include <string.h>
+#include <math.h>
 #include <Accelerate/Accelerate.h>
 #include <dispatch/dispatch.h>
 #include <arm_neon.h>
@@ -27,6 +28,93 @@ static inline float qwen_dot_f32(const float *a, const float *b, int n) {
   float s = vaddvq_f32(vaddq_f32(acc0, acc1));
   for (; i < n; i++) s += a[i] * b[i];
   return s;
+}
+
+/* ===================================================================== */
+/* Attention vectorization: do one layer's full multi-head SDPA in C.     */
+/*                                                                         */
+/* The pool stretch showed the decode bottleneck is the SERIAL OCaml work */
+/* between matvecs -- chiefly attention, which at long context is O(T) per */
+/* token over the KV cache. This stub replaces the per-head OCaml scalar   */
+/* loops (QK dot, softmax, V-weighted-sum) with one C call per layer:      */
+/* NEON dots, softmax in DOUBLE (to match Ops.softmax_inplace's argmax),   */
+/* NEON fma weighted-sum. k/v are already written into the cache by OCaml. */
+/*                                                                         */
+/* Numerics: QK uses a double accumulator + double scale, matching the     */
+/* OCaml `acc *. scale` exactly up to reduction order; softmax is double   */
+/* like OCaml; the V-sum uses float32 NEON fma (tiny ULP diff vs OCaml's   */
+/* per-step double round, well within argmax tolerance). [@@noalloc], no   */
+/* runtime release (called with the runtime held; pure C, no caml_*). */
+static inline double qwen_dot_f64(const float *a, const float *b, int n) {
+  /* double accumulation in two NEON f64x2 lanes, matching OCaml's double dot
+     to ~1e-16 (reduction order differs but precision is double). */
+  float64x2_t acc0 = vdupq_n_f64(0.0), acc1 = vdupq_n_f64(0.0);
+  int i = 0;
+  for (; i + 4 <= n; i += 4) {
+    float32x4_t a4 = vld1q_f32(a + i), b4 = vld1q_f32(b + i);
+    acc0 = vfmaq_f64(acc0, vcvt_f64_f32(vget_low_f32(a4)),  vcvt_f64_f32(vget_low_f32(b4)));
+    acc1 = vfmaq_f64(acc1, vcvt_f64_f32(vget_high_f32(a4)), vcvt_f64_f32(vget_high_f32(b4)));
+  }
+  double s = vaddvq_f64(vaddq_f64(acc0, acc1));
+  for (; i < n; i++) s += (double)a[i] * (double)b[i];
+  return s;
+}
+
+/* caml_qwen_attn(q, kc, vc, out, scores, pos, n_heads, n_kv, head_dim, max_seq):
+   GQA scaled-dot-product attention for ALL heads at decode step [pos].
+   q   : [n_heads*head_dim] current query (RoPE-applied)
+   kc/vc: layer KV cache [n_kv*max_seq*head_dim]; keys/values 0..pos already in.
+   out : [n_heads*head_dim] result (pre o_proj). scores: scratch >= pos+1. */
+CAMLprim value caml_qwen_attn(value vQ, value vKc, value vVc, value vOut, value vScores,
+                              value vPos, value vNHeads, value vNKv, value vHeadDim, value vMaxSeq) {
+  const float *q  = (const float *) Caml_ba_data_val(vQ);
+  const float *kc = (const float *) Caml_ba_data_val(vKc);
+  const float *vc = (const float *) Caml_ba_data_val(vVc);
+  float *out      = (float *) Caml_ba_data_val(vOut);
+  float *scores   = (float *) Caml_ba_data_val(vScores);
+  int pos = (int) Long_val(vPos);
+  int n_heads = (int) Long_val(vNHeads);
+  int n_kv = (int) Long_val(vNKv);
+  int head_dim = (int) Long_val(vHeadDim);
+  int max_seq = (int) Long_val(vMaxSeq);
+  int group = n_heads / n_kv;
+  int n_keys = pos + 1;
+  double scale = 1.0 / sqrt((double) head_dim);
+
+  for (int h = 0; h < n_heads; h++) {
+    int kh = h / group;
+    const float *qh = q + (size_t)h * head_dim;
+    const float *kbase = kc + (size_t)kh * max_seq * head_dim;
+    const float *vbase = vc + (size_t)kh * max_seq * head_dim;
+    /* scores[p] = scale * (q_h . k_p) */
+    for (int p = 0; p < n_keys; p++)
+      scores[p] = (float)(scale * qwen_dot_f64(qh, kbase + (size_t)p * head_dim, head_dim));
+    /* stable softmax in double (matches Ops.softmax_inplace) */
+    double m = (double) scores[0];
+    for (int p = 1; p < n_keys; p++) if ((double)scores[p] > m) m = (double)scores[p];
+    double sum = 0.0;
+    for (int p = 0; p < n_keys; p++) { double e = exp((double)scores[p] - m); scores[p] = (float)e; sum += e; }
+    double inv = 1.0 / sum;
+    for (int p = 0; p < n_keys; p++) scores[p] = (float)((double)scores[p] * inv);
+    /* out_h = sum_p scores[p] * v_p  (NEON fma, accumulate in registers) */
+    float *oh = out + (size_t)h * head_dim;
+    for (int d = 0; d < head_dim; d++) oh[d] = 0.0f;
+    for (int p = 0; p < n_keys; p++) {
+      float32x4_t w = vdupq_n_f32(scores[p]);
+      const float *vp = vbase + (size_t)p * head_dim;
+      int d = 0;
+      for (; d + 4 <= head_dim; d += 4)
+        vst1q_f32(oh + d, vfmaq_f32(vld1q_f32(oh + d), w, vld1q_f32(vp + d)));
+      for (; d < head_dim; d++) oh[d] += scores[p] * vp[d];
+    }
+  }
+  return Val_unit;
+}
+
+CAMLprim value caml_qwen_attn_bc(value *argv, int argn) {
+  (void)argn;
+  return caml_qwen_attn(argv[0], argv[1], argv[2], argv[3], argv[4],
+                        argv[5], argv[6], argv[7], argv[8], argv[9]);
 }
 
 /* Sanity stub so the library links from day one. Returns the dot product of

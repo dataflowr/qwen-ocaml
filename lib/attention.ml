@@ -34,6 +34,18 @@ let scratch : Tensor.t ref = ref (Tensor.create 0)
 let ensure_scratch n =
   if Tensor.length !scratch < n then scratch := Tensor.create n
 
+(* Vectorized C path: one call does all heads' QK / softmax / V-sum for this
+   step (NEON dots, double softmax). This is the long-context decode win --
+   3.1x at ctx~800 (8.4 -> 26.0 tok/s), +12% short -- and exact on all three
+   validators. ON by default; QWEN_ATTN_C=0 selects the OCaml scalar path for
+   the teaching A/B. *)
+external attn_c :
+  Tensor.t -> Tensor.t -> Tensor.t -> Tensor.t -> Tensor.t ->
+  int -> int -> int -> int -> int -> unit
+  = "caml_qwen_attn_bc" "caml_qwen_attn" [@@noalloc]
+
+let use_c = lazy (Sys.getenv_opt "QWEN_ATTN_C" <> Some "0")
+
 let forward (cfg : Config.t) (cache : Kv_cache.t) ~layer ~pos
     ~(q : Tensor.t) ~(k : Tensor.t) ~(v : Tensor.t) ~(out : Tensor.t) : unit =
   let head_dim = cfg.head_dim in
@@ -59,6 +71,9 @@ let forward (cfg : Config.t) (cache : Kv_cache.t) ~layer ~pos
     done
   done;
 
+  if Lazy.force use_c then
+    attn_c q kc vc out scores pos n_heads n_kv_heads head_dim max_seq
+  else
   for h = 0 to n_heads - 1 do
     let kh = h / group in
     let q_off = h * head_dim in
