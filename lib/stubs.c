@@ -29,6 +29,30 @@ static inline float qwen_dot_f32(const float *a, const float *b, int n) {
   return s;
 }
 
+/* P1 helpers: widen 16 packed ints to 4x float32x4, scale, store into y[0..15].
+ * vmulq_n_f32(f, s) == s * (float)q with the SAME scalar rounding as the
+ * reference loop (no FMA contraction), so the dequant output stays token-exact. */
+static inline void q_store16_s8(float *y, int8x16_t v, float scale) {
+  int16x8_t lo = vmovl_s8(vget_low_s8(v));
+  int16x8_t hi = vmovl_s8(vget_high_s8(v));
+  vst1q_f32(y +  0, vmulq_n_f32(vcvtq_f32_s32(vmovl_s16(vget_low_s16(lo))),  scale));
+  vst1q_f32(y +  4, vmulq_n_f32(vcvtq_f32_s32(vmovl_s16(vget_high_s16(lo))), scale));
+  vst1q_f32(y +  8, vmulq_n_f32(vcvtq_f32_s32(vmovl_s16(vget_low_s16(hi))),  scale));
+  vst1q_f32(y + 12, vmulq_n_f32(vcvtq_f32_s32(vmovl_s16(vget_high_s16(hi))), scale));
+}
+
+/* widen 16 unsigned nibbles/bytes, scale, subtract a per-group min, store.
+ * Separate vmulq+vsubq (NOT vfms) mirrors the reference `d*x - m` exactly. */
+static inline void q_store16_u8_sub(float *y, uint8x16_t v, float scale, float minus) {
+  uint16x8_t lo = vmovl_u8(vget_low_u8(v));
+  uint16x8_t hi = vmovl_u8(vget_high_u8(v));
+  float32x4_t m = vdupq_n_f32(minus);
+  vst1q_f32(y +  0, vsubq_f32(vmulq_n_f32(vcvtq_f32_u32(vmovl_u16(vget_low_u16(lo))),  scale), m));
+  vst1q_f32(y +  4, vsubq_f32(vmulq_n_f32(vcvtq_f32_u32(vmovl_u16(vget_high_u16(lo))), scale), m));
+  vst1q_f32(y +  8, vsubq_f32(vmulq_n_f32(vcvtq_f32_u32(vmovl_u16(vget_low_u16(hi))),  scale), m));
+  vst1q_f32(y + 12, vsubq_f32(vmulq_n_f32(vcvtq_f32_u32(vmovl_u16(vget_high_u16(hi))), scale), m));
+}
+
 /* Sanity stub so the library links from day one. Returns the dot product of
  * two float32 Bigarray.Array1 of length n. Replace/extend with SIMD kernels. */
 CAMLprim value caml_qwen_sdot(value vA, value vB, value vN) {
@@ -130,7 +154,7 @@ static inline uint16_t qwen_rd_u16le(const uint8_t *p) {
   return (uint16_t)(p[0] | (p[1] << 8));
 }
 
-/* --- Q8_0: 34 bytes / 32 weights.  w[j] = d * qs[j] --- */
+/* --- Q8_0: 34 bytes / 32 weights.  w[j] = d * qs[j] --- (P1: NEON) */
 static void dequant_row_q8_0(const uint8_t *src, float *dst, int n) {
   int nb = n / QK8_0;
   for (int b = 0; b < nb; b++) {
@@ -138,29 +162,33 @@ static void dequant_row_q8_0(const uint8_t *src, float *dst, int n) {
     float d = qwen_half_to_float(qwen_rd_u16le(p));
     const int8_t *qs = (const int8_t *)(p + 2);
     float *y = dst + (size_t)b * QK8_0;
-    for (int j = 0; j < QK8_0; j++) y[j] = d * (float)qs[j];
+    q_store16_s8(y + 0,  vld1q_s8(qs + 0),  d);
+    q_store16_s8(y + 16, vld1q_s8(qs + 16), d);
   }
 }
 
-/* --- Q5_0: 22 bytes / 32 weights --- */
+/* --- Q5_0: 22 bytes / 32 weights --- (P1: scalar 5-bit unpack, NEON multiply)
+   The high-bit gather from qh does not vectorize cleanly, so we unpack the
+   5-bit signed weights into a temp int8[32] with the EXACT scalar integer
+   semantics, then vectorize the int->float->*d step (the actual hot cost). */
 static void dequant_row_q5_0(const uint8_t *src, float *dst, int n) {
   int nb = n / QK5_0;
   for (int b = 0; b < nb; b++) {
     const uint8_t *p = src + (size_t)b * Q5_0_BYTES;
     float d = qwen_half_to_float(qwen_rd_u16le(p));
-    const uint8_t *qh = p + 2;
     const uint8_t *qs = p + 6;
     uint32_t QH;
-    memcpy(&QH, qh, 4);
+    memcpy(&QH, p + 2, 4);
     float *y = dst + (size_t)b * QK5_0;
+    int8_t q[32];
     for (int j = 0; j < 16; j++) {
       uint8_t xh0 = (uint8_t)(((QH >> (j +  0)) << 4) & 0x10);
       uint8_t xh1 = (uint8_t)(((QH >> (j + 12))     ) & 0x10);
-      int32_t q0 = ((qs[j] & 0x0F) | xh0) - 16;
-      int32_t q1 = ((qs[j] >>   4) | xh1) - 16;
-      y[j]      = d * (float)q0;
-      y[j + 16] = d * (float)q1;
+      q[j]      = (int8_t)(((qs[j] & 0x0F) | xh0) - 16);
+      q[j + 16] = (int8_t)(((qs[j] >>   4) | xh1) - 16);
     }
+    q_store16_s8(y + 0,  vld1q_s8(q + 0),  d);
+    q_store16_s8(y + 16, vld1q_s8(q + 16), d);
   }
 }
 
@@ -192,9 +220,14 @@ static void dequant_row_q4_k(const uint8_t *src, float *dst, int n) {
       float d1 = d * (float)d6, m1 = dmin * (float)m6;
       q4k_get_scale_min(is + 1, sc, &d6, &m6);
       float d2 = d * (float)d6, m2 = dmin * (float)m6;
-      for (int l = 0; l < 32; l++) *y++ = d1 * (float)(q[l] & 0xF) - m1;
-      for (int l = 0; l < 32; l++) *y++ = d2 * (float)(q[l] >>  4) - m2;
-      q += 32; is += 2;
+      /* low nibbles -> y[0..31] with (d1,m1); high nibbles -> y[32..63] (d2,m2) */
+      uint8x16_t lo = vdupq_n_u8(0x0F);
+      uint8x16_t q0 = vld1q_u8(q + 0), q16 = vld1q_u8(q + 16);
+      q_store16_u8_sub(y +  0, vandq_u8(q0,  lo), d1, m1);
+      q_store16_u8_sub(y + 16, vandq_u8(q16, lo), d1, m1);
+      q_store16_u8_sub(y + 32, vshrq_n_u8(q0,  4), d2, m2);
+      q_store16_u8_sub(y + 48, vshrq_n_u8(q16, 4), d2, m2);
+      y += 64; q += 32; is += 2;
     }
   }
 }
@@ -210,17 +243,18 @@ static void dequant_row_q6_k(const uint8_t *src, float *dst, int n) {
     float d = qwen_half_to_float(qwen_rd_u16le(p + 208));
     float *y = dst + (size_t)b * QK_K;
     for (int n2 = 0; n2 < QK_K; n2 += 128) {
+      /* unpack the 6-bit signed weights into y-order temp with the EXACT scalar
+         integer semantics; then each contiguous 16-lane region has a single
+         scale d*sc[region], so the float multiply vectorizes cleanly. */
+      int8_t t[128];
       for (int l = 0; l < 32; l++) {
-        int is = l / 16;
-        int32_t q1 = ((ql[l +  0] & 0xF) | (((qh[l] >> 0) & 3) << 4)) - 32;
-        int32_t q2 = ((ql[l + 32] & 0xF) | (((qh[l] >> 2) & 3) << 4)) - 32;
-        int32_t q3 = ((ql[l +  0] >>  4) | (((qh[l] >> 4) & 3) << 4)) - 32;
-        int32_t q4 = ((ql[l + 32] >>  4) | (((qh[l] >> 6) & 3) << 4)) - 32;
-        y[l +  0] = d * (float)sc[is + 0] * (float)q1;
-        y[l + 32] = d * (float)sc[is + 2] * (float)q2;
-        y[l + 64] = d * (float)sc[is + 4] * (float)q3;
-        y[l + 96] = d * (float)sc[is + 6] * (float)q4;
+        t[l +  0] = (int8_t)(((ql[l +  0] & 0xF) | (((qh[l] >> 0) & 3) << 4)) - 32);
+        t[l + 32] = (int8_t)(((ql[l + 32] & 0xF) | (((qh[l] >> 2) & 3) << 4)) - 32);
+        t[l + 64] = (int8_t)(((ql[l +  0] >>  4) | (((qh[l] >> 4) & 3) << 4)) - 32);
+        t[l + 96] = (int8_t)(((ql[l + 32] >>  4) | (((qh[l] >> 6) & 3) << 4)) - 32);
       }
+      for (int rgn = 0; rgn < 8; rgn++)
+        q_store16_s8(y + rgn * 16, vld1q_s8(t + rgn * 16), d * (float)sc[rgn]);
       ql += 64; qh += 32; sc += 8; y += 128;
     }
   }
