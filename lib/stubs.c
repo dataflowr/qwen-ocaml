@@ -11,6 +11,7 @@
 #include <caml/alloc.h>
 #include <caml/fail.h>
 #include <stdint.h>
+#include <stdlib.h>
 #include <string.h>
 #include <math.h>
 #include <Accelerate/Accelerate.h>
@@ -60,11 +61,57 @@ static inline double qwen_dot_f64(const float *a, const float *b, int n) {
   return s;
 }
 
+/* One head's SDPA at decode step [pos], into out[h*head_dim ..]. [sc] is a
+   scratch buffer of length >= pos+1, PRIVATE to this call (so heads can run in
+   parallel). Identical numerics to the OCaml scalar path (double QK/softmax). */
+static inline void qwen_attn_head(int h, const float *q, const float *kc, const float *vc,
+                                  float *out, float *sc, int pos, int group,
+                                  int head_dim, int max_seq, double scale) {
+  int kh = h / group;
+  int n_keys = pos + 1;
+  const float *qh = q + (size_t)h * head_dim;
+  const float *kbase = kc + (size_t)kh * max_seq * head_dim;
+  const float *vbase = vc + (size_t)kh * max_seq * head_dim;
+  for (int p = 0; p < n_keys; p++)
+    sc[p] = (float)(scale * qwen_dot_f64(qh, kbase + (size_t)p * head_dim, head_dim));
+  double m = (double) sc[0];
+  for (int p = 1; p < n_keys; p++) if ((double)sc[p] > m) m = (double)sc[p];
+  double sum = 0.0;
+  for (int p = 0; p < n_keys; p++) { double e = exp((double)sc[p] - m); sc[p] = (float)e; sum += e; }
+  double inv = 1.0 / sum;
+  for (int p = 0; p < n_keys; p++) sc[p] = (float)((double)sc[p] * inv);
+  float *oh = out + (size_t)h * head_dim;
+  for (int d = 0; d < head_dim; d++) oh[d] = 0.0f;
+  for (int p = 0; p < n_keys; p++) {
+    float32x4_t w = vdupq_n_f32(sc[p]);
+    const float *vp = vbase + (size_t)p * head_dim;
+    int d = 0;
+    for (; d + 4 <= head_dim; d += 4)
+      vst1q_f32(oh + d, vfmaq_f32(vld1q_f32(oh + d), w, vld1q_f32(vp + d)));
+    for (; d < head_dim; d++) oh[d] += sc[p] * vp[d];
+  }
+}
+
+/* Head-parallel attention: env QWEN_ATTN_PAR is the n_keys threshold -- run the
+   per-head loop across cores (one dispatch_apply/layer) iff (T>0 && n_keys>=T).
+   Default 0 = OFF, because it never wins (see commit msg): the single-threaded
+   NEON attention is already fast enough that it is NOT the decode bottleneck --
+   the weight matvecs are -- so spreading heads across cores buys nothing at long
+   context (1200 tok: serial 24.4 == parallel 24.4) and the per-LAYER dispatch
+   (~24/token) makes it SLOWER at short/mid context (400 tok: 26.2 -> 24.5).
+   Kept opt-in for the teaching A/B. */
+static int qwen_attn_par_threshold(void) {
+  static int v = -1;
+  if (v < 0) { const char *s = getenv("QWEN_ATTN_PAR"); v = s ? atoi(s) : 0; if (v < 0) v = 0; }
+  return v;
+}
+
 /* caml_qwen_attn(q, kc, vc, out, scores, pos, n_heads, n_kv, head_dim, max_seq):
    GQA scaled-dot-product attention for ALL heads at decode step [pos].
    q   : [n_heads*head_dim] current query (RoPE-applied)
    kc/vc: layer KV cache [n_kv*max_seq*head_dim]; keys/values 0..pos already in.
-   out : [n_heads*head_dim] result (pre o_proj). scores: scratch >= pos+1. */
+   out : [n_heads*head_dim] result (pre o_proj). scores: scratch >= pos+1
+   (serial path only; parallel heads use private VLA scratch). */
 CAMLprim value caml_qwen_attn(value vQ, value vKc, value vVc, value vOut, value vScores,
                               value vPos, value vNHeads, value vNKv, value vHeadDim, value vMaxSeq) {
   const float *q  = (const float *) Caml_ba_data_val(vQ);
@@ -81,32 +128,16 @@ CAMLprim value caml_qwen_attn(value vQ, value vKc, value vVc, value vOut, value 
   int n_keys = pos + 1;
   double scale = 1.0 / sqrt((double) head_dim);
 
-  for (int h = 0; h < n_heads; h++) {
-    int kh = h / group;
-    const float *qh = q + (size_t)h * head_dim;
-    const float *kbase = kc + (size_t)kh * max_seq * head_dim;
-    const float *vbase = vc + (size_t)kh * max_seq * head_dim;
-    /* scores[p] = scale * (q_h . k_p) */
-    for (int p = 0; p < n_keys; p++)
-      scores[p] = (float)(scale * qwen_dot_f64(qh, kbase + (size_t)p * head_dim, head_dim));
-    /* stable softmax in double (matches Ops.softmax_inplace) */
-    double m = (double) scores[0];
-    for (int p = 1; p < n_keys; p++) if ((double)scores[p] > m) m = (double)scores[p];
-    double sum = 0.0;
-    for (int p = 0; p < n_keys; p++) { double e = exp((double)scores[p] - m); scores[p] = (float)e; sum += e; }
-    double inv = 1.0 / sum;
-    for (int p = 0; p < n_keys; p++) scores[p] = (float)((double)scores[p] * inv);
-    /* out_h = sum_p scores[p] * v_p  (NEON fma, accumulate in registers) */
-    float *oh = out + (size_t)h * head_dim;
-    for (int d = 0; d < head_dim; d++) oh[d] = 0.0f;
-    for (int p = 0; p < n_keys; p++) {
-      float32x4_t w = vdupq_n_f32(scores[p]);
-      const float *vp = vbase + (size_t)p * head_dim;
-      int d = 0;
-      for (; d + 4 <= head_dim; d += 4)
-        vst1q_f32(oh + d, vfmaq_f32(vld1q_f32(oh + d), w, vld1q_f32(vp + d)));
-      for (; d < head_dim; d++) oh[d] += scores[p] * vp[d];
-    }
+  if (n_heads > 1 && n_keys >= qwen_attn_par_threshold() && qwen_attn_par_threshold() > 0) {
+    /* heads are independent: each writes a disjoint out[] slice and uses its
+       own VLA scratch -> no sharing, no race. pure C; no caml_* in the block. */
+    dispatch_apply(n_heads, DISPATCH_APPLY_AUTO, ^(size_t h) {
+      float sc[n_keys];
+      qwen_attn_head((int)h, q, kc, vc, out, sc, pos, group, head_dim, max_seq, scale);
+    });
+  } else {
+    for (int h = 0; h < n_heads; h++)
+      qwen_attn_head(h, q, kc, vc, out, scores, pos, group, head_dim, max_seq, scale);
   }
   return Val_unit;
 }
