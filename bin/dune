@@ -1,0 +1,19 @@
+(executable
+ (name run)
+ (modules run)
+ (libraries qwen unix))
+
+(executable
+ (name validate)
+ (modules validate)
+ (libraries qwen re))
+
+(executable
+ (name validate_gguf)
+ (modules validate_gguf)
+ (libraries qwen unix))
+
+(executable
+ (name validate_qwen3)
+ (modules validate_qwen3)
+ (libraries qwen re))

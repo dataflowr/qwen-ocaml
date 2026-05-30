@@ -1,0 +1,11 @@
+(library
+ (name qwen)
+ (libraries re unix)
+ (foreign_stubs
+  (language c)
+  (names stubs)
+  (flags
+   (:standard -O3 -ffast-math -mcpu=native -DACCELERATE_NEW_LAPACK)))
+ (c_library_flags (-framework Accelerate))
+ (ocamlopt_flags
+  (:standard -O3 -inline 100)))

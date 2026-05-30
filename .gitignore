@@ -1,0 +1,5 @@
+_build/
+.venv/
+models/
+scripts/ref_*.npy
+scripts/ref_*.json
