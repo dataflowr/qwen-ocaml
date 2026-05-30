@@ -11,8 +11,10 @@
 #include <caml/alloc.h>
 #include <caml/fail.h>
 #include <stdint.h>
+#include <stdlib.h>
 #include <string.h>
 #include <math.h>
+#include <sys/sysctl.h>
 #include <Accelerate/Accelerate.h>
 #include <dispatch/dispatch.h>
 #include <arm_neon.h>
@@ -360,6 +362,46 @@ CAMLprim value caml_qwen_dequant_row(value vBlob, value vOff, value vTy,
   return Val_unit;
 }
 
+/* Number of performance (P) cores, queried once. M3 Max = 12. */
+static int qwen_pcores(void) {
+  static int v = -1;
+  if (v < 0) {
+    int n = 0; size_t sz = sizeof(n);
+    if (sysctlbyname("hw.perflevel0.logicalcpu", &n, &sz, NULL, 0) != 0 || n < 1) {
+      sz = sizeof(n);
+      if (sysctlbyname("hw.logicalcpu", &n, &sz, NULL, 0) != 0 || n < 1) n = 8;
+    }
+    v = n;
+  }
+  return v;
+}
+
+/* P3 tunables (read once): dispatch chunk count and the serial-cutoff row
+ * count. Lets us sweep threading granularity without recompiling.
+ *
+ * KEY P3 RESULT: the original fixed 32 chunks is SLOWER than matching the chunk
+ * count to the available P-cores. dispatch_apply(32, AUTO) spills work onto the
+ * 4 slow E-cores, which become stragglers at the implicit barrier. Sweep on
+ * M3 Max (12 P-cores), interleaved decode tok/s: 32->23.8, 12->27.0, 10->28.9.
+ * The optimum is ~2 BELOW the P-core count: using all 12 P-cores starves the
+ * OCaml main thread + GCD coordinator, so leaving ~2 free is best. Default =
+ * max(1, P-cores - 2); this is numerically EXACT (only repartitions rows) and
+ * gives ~+21% decode here. Override with QWEN_NCHUNKS for the scaling sweep. */
+static int qwen_nchunks(void) {
+  static int v = -1;
+  if (v < 0) {
+    const char *s = getenv("QWEN_NCHUNKS");
+    v = s ? atoi(s) : qwen_pcores() - 2;
+    if (v < 1) v = 1;
+  }
+  return v;
+}
+static int qwen_serial_rows(void) {
+  static int v = -1;
+  if (v < 0) { const char *s = getenv("QWEN_SERIAL_ROWS"); v = s ? atoi(s) : 256; if (v < 0) v = 0; }
+  return v;
+}
+
 /* Fused GEMV: out[r] = dot(dequant(row r), x[0..cols)) for r in 0..rows.
  * Rows are contiguous; per-row byte stride from qwen_row_bytes. */
 CAMLprim value caml_qwen_qmatvec(value vBlob, value vBase, value vTy,
@@ -398,14 +440,14 @@ CAMLprim value caml_qwen_qmatvec(value vBlob, value vBase, value vTy,
      does substantial work and launch overhead is amortized; small matvecs run
      serially to skip dispatch overhead entirely. */
   const int icols = (int) cols;
-  if (rows <= 256) {
+  if (rows <= qwen_serial_rows()) {
     float scratch[icols];
     for (intnat r = 0; r < rows; r++) {
       qwen_dequant_dispatch(ty, src0 + (size_t)r * stride, scratch, icols);
       out[r] = qwen_dot_f32(scratch, x, icols);
     }
   } else {
-    size_t n_chunks = 32;
+    size_t n_chunks = (size_t) qwen_nchunks();
     size_t chunk = ((size_t)rows + n_chunks - 1) / n_chunks;
     dispatch_apply(n_chunks, DISPATCH_APPLY_AUTO, ^(size_t c) {
       float scratch[icols];
