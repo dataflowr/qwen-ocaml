@@ -17,3 +17,8 @@
  (name validate_qwen3)
  (modules validate_qwen3)
  (libraries qwen re))
+
+(executable
+ (name tf_int8)
+ (modules tf_int8)
+ (libraries qwen))
