@@ -1,9 +1,9 @@
 (* Validate the Qwen3-0.6B fp32 forward pass against the HF reference
    (scripts/ref_qwen3_ files). Exercises QK-Norm, no-bias, decoupled head_dim. *)
 
-let model_path = "/Users/lelarge/courses/Qwen_Ocaml/models/Qwen3-0.6B/model.safetensors"
-let tokens_json = "/Users/lelarge/courses/Qwen_Ocaml/scripts/ref_qwen3_tokens.json"
-let logits_f32 = "/Users/lelarge/courses/Qwen_Ocaml/scripts/ref_qwen3_logits.f32"
+let model_path = Qwen.Paths.resolve "models/Qwen3-0.6B/model.safetensors"
+let tokens_json = Qwen.Paths.resolve "scripts/ref_qwen3_tokens.json"
+let logits_f32 = Qwen.Paths.resolve "scripts/ref_qwen3_logits.f32"
 
 let read_file path =
   let ic = open_in_bin path in
