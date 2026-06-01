@@ -1,5 +1,5 @@
 (* CLI: load model, encode prompt, generate. *)
-let model_dir = "/Users/lelarge/courses/Qwen_Ocaml/models/Qwen2.5-0.5B"
+let model_dir = Qwen.Paths.resolve "models/Qwen2.5-0.5B"
 
 let () =
   let prompt =

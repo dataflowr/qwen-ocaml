@@ -4,9 +4,9 @@
    scripts/llama_ref_gguf.txt. Times load + tok/s. *)
 
 let gguf_path =
-  "/Users/lelarge/courses/Qwen_Ocaml/models/Qwen2.5-0.5B-Instruct-GGUF/Qwen2.5-0.5B-Instruct-Q4_K_M.gguf"
-let tokenizer_path = "/Users/lelarge/courses/Qwen_Ocaml/models/Qwen2.5-0.5B/tokenizer.json"
-let ref_path = "/Users/lelarge/courses/Qwen_Ocaml/scripts/llama_ref_gguf.txt"
+  Qwen.Paths.resolve "models/Qwen2.5-0.5B-Instruct-GGUF/Qwen2.5-0.5B-Instruct-Q4_K_M.gguf"
+let tokenizer_path = Qwen.Paths.resolve "models/Qwen2.5-0.5B/tokenizer.json"
+let ref_path = Qwen.Paths.resolve "scripts/llama_ref_gguf.txt"
 
 let prompt_ids = [785; 6722; 315; 9625; 374]
 let prompt = "The capital of France is"
