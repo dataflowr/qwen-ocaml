@@ -5,7 +5,7 @@
    (free-running diverges at the first near-tie and compounds). *)
 
 let gguf_path =
-  "/Users/lelarge/courses/Qwen_Ocaml/models/Qwen2.5-0.5B-Instruct-GGUF/Qwen2.5-0.5B-Instruct-Q4_K_M.gguf"
+  Qwen.Paths.resolve "models/Qwen2.5-0.5B-Instruct-GGUF/Qwen2.5-0.5B-Instruct-Q4_K_M.gguf"
 
 let prompt_ids = [785; 6722; 315; 9625; 374]
 
