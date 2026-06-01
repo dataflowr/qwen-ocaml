@@ -2,9 +2,9 @@
    - scripts/ref_tokens.json : prompt_ids, greedy_tokens, n_steps, vocab
    - scripts/ref_logits.f32   : raw LE float32, n_steps*vocab *)
 
-let model_path = "/Users/lelarge/courses/Qwen_Ocaml/models/Qwen2.5-0.5B/model.safetensors"
-let tokens_json = "/Users/lelarge/courses/Qwen_Ocaml/scripts/ref_tokens.json"
-let logits_f32 = "/Users/lelarge/courses/Qwen_Ocaml/scripts/ref_logits.f32"
+let model_path = Qwen.Paths.resolve "models/Qwen2.5-0.5B/model.safetensors"
+let tokens_json = Qwen.Paths.resolve "scripts/ref_tokens.json"
+let logits_f32 = Qwen.Paths.resolve "scripts/ref_logits.f32"
 
 (* hand parse: extract int list following "key" *)
 let read_file path =
