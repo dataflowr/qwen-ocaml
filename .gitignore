@@ -3,3 +3,4 @@ _build/
 models/
 scripts/ref_*.npy
 scripts/ref_*.json
+scripts/*-workflow.js
